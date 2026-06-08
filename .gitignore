@@ -1,0 +1,13 @@
+# Dependencies
+node_modules
+
+# Build
+main.js
+*.js.map
+
+# Obsidian
+.obsidian/
+
+# OS
+.DS_Store
+Thumbs.db

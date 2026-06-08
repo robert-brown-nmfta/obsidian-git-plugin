@@ -1,0 +1,11 @@
+{
+  "id": "obsidian-git-integration",
+  "name": "Git Integration",
+  "version": "1.0.0",
+  "minAppVersion": "1.4.0",
+  "description": "Integrates Git into Obsidian. Stage, commit, push, pull, and view git history directly from your vault.",
+  "author": "",
+  "authorUrl": "",
+  "fundingUrl": "",
+  "isDesktopOnly": true
+}
