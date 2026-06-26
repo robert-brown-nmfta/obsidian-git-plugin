@@ -621,12 +621,39 @@ class GitChangesDiffModal extends Modal {
 			const pathEl = label.createEl("span", { text: change.path });
 			pathEl.style.fontSize = "12px";
 			pathEl.style.wordBreak = "break-all";
+			pathEl.style.flex = "1";
+			pathEl.style.minWidth = "0";
 
-			const kindEl = label.createEl("span", { text: change.kind });
+			const rightGroup = label.createDiv();
+			rightGroup.style.display = "flex";
+			rightGroup.style.alignItems = "center";
+			rightGroup.style.gap = "6px";
+			rightGroup.style.flexShrink = "0";
+
+			const kindEl = rightGroup.createEl("span", { text: change.kind });
 			kindEl.style.fontSize = "11px";
 			kindEl.style.color = "var(--text-muted)";
 			kindEl.style.textTransform = "uppercase";
 			kindEl.style.letterSpacing = "0.04em";
+
+			const isStaged = change.kind === "staged";
+			const stageBtn = rightGroup.createEl("button", { text: isStaged ? "Unstage" : "Stage" });
+			stageBtn.style.fontSize = "11px";
+			stageBtn.style.padding = "2px 7px";
+			stageBtn.style.border = "1px solid var(--background-modifier-border)";
+			stageBtn.style.borderRadius = "4px";
+			stageBtn.style.background = "var(--background-secondary)";
+			stageBtn.style.cursor = "pointer";
+			stageBtn.style.color = isStaged ? "var(--color-orange)" : "var(--color-green)";
+			stageBtn.addEventListener("click", async (e) => {
+				e.stopPropagation();
+				if (isStaged) {
+					await this.plugin.gitUnstageFile(change.path);
+				} else {
+					await this.plugin.gitStageFile(change.path);
+				}
+				await this.loadChanges();
+			});
 
 			row.addEventListener("click", async () => {
 				this.selectedKey = key;
@@ -1254,6 +1281,26 @@ export default class GitIntegrationPlugin extends Plugin {
 			this.updateStatusBar();
 		} catch (e) {
 			this.handleError("unstage changes", e);
+		}
+	}
+
+	async gitStageFile(path: string): Promise<void> {
+		try {
+			await this.git.add(path);
+			new Notice(`Staged: ${path}`);
+			this.updateStatusBar();
+		} catch (e) {
+			this.handleError("stage file", e);
+		}
+	}
+
+	async gitUnstageFile(path: string): Promise<void> {
+		try {
+			await this.git.reset(["HEAD", "--", path]);
+			new Notice(`Unstaged: ${path}`);
+			this.updateStatusBar();
+		} catch (e) {
+			this.handleError("unstage file", e);
 		}
 	}
 
