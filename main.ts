@@ -129,6 +129,9 @@ export class GitSidebarView extends ItemView {
 		makeBtn("Push", `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg>`, () => {
 			this.plugin.gitPush().then(() => this.render());
 		});
+		makeBtn("Review Diffs", `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1.5 12.5a2 2 0 0 1-2 1.5h-7a2 2 0 0 1-2-1.5L5 6"/><path d="M10 11h4"/></svg>`, () => {
+			this.plugin.gitShowChangesDiffPopup();
+		});
 		if (status.staged.length > 0) {
 			makeBtn("Unstage All", `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/><line x1="2" y1="2" x2="22" y2="22"/></svg>`, () => {
 				this.plugin.gitUnstageAll().then(() => this.render());
@@ -247,6 +250,13 @@ interface GitIntegrationSettings {
 	defaultCommitMessage: string;
 	showStatusBar: boolean;
 	dateFormat: string;
+}
+
+type GitChangeKind = "staged" | "modified" | "untracked" | "deleted" | "conflicted";
+
+interface GitChangeEntry {
+	path: string;
+	kind: GitChangeKind;
 }
 
 const DEFAULT_SETTINGS: GitIntegrationSettings = {
@@ -440,6 +450,334 @@ class GitStatusModal extends Modal {
 }
 
 // ---------------------------------------------------------------------------
+// Git Changes + Diff Modal
+// ---------------------------------------------------------------------------
+
+class GitChangesDiffModal extends Modal {
+	private plugin: GitIntegrationPlugin;
+	private changes: GitChangeEntry[] = [];
+	private selectedKey: string | null = null;
+	private currentDiffText = "";
+	private viewMode: "unified" | "split" = "unified";
+	private listEl: HTMLElement;
+	private diffEl: HTMLElement;
+	private viewModeLabelEl: HTMLElement;
+
+	constructor(app: App, plugin: GitIntegrationPlugin) {
+		super(app);
+		this.plugin = plugin;
+	}
+
+	async onOpen() {
+		const { contentEl } = this;
+		this.modalEl.style.width = "88vw";
+		this.modalEl.style.maxWidth = "1500px";
+		this.modalEl.style.height = "82vh";
+		this.modalEl.style.maxHeight = "90vh";
+		contentEl.empty();
+		contentEl.style.height = "100%";
+		contentEl.style.display = "flex";
+		contentEl.style.flexDirection = "column";
+		contentEl.createEl("h2", { text: "Changes and Diff" });
+
+		const layout = contentEl.createDiv();
+		layout.style.display = "grid";
+		layout.style.gridTemplateColumns = "minmax(280px, 30%) 1fr";
+		layout.style.gap = "12px";
+		layout.style.height = "100%";
+		layout.style.minHeight = "420px";
+
+		const left = layout.createDiv();
+		left.style.border = "1px solid var(--background-modifier-border)";
+		left.style.borderRadius = "8px";
+		left.style.overflow = "hidden";
+		left.style.display = "flex";
+		left.style.flexDirection = "column";
+
+		const leftHeader = left.createDiv();
+		leftHeader.style.padding = "8px 10px";
+		leftHeader.style.borderBottom = "1px solid var(--background-modifier-border)";
+		leftHeader.style.fontSize = "12px";
+		leftHeader.style.fontWeight = "600";
+		leftHeader.style.textTransform = "uppercase";
+		leftHeader.style.letterSpacing = "0.05em";
+		leftHeader.style.color = "var(--text-muted)";
+		leftHeader.setText("Changed Files");
+
+		this.listEl = left.createDiv();
+		this.listEl.style.overflowY = "auto";
+		this.listEl.style.padding = "6px";
+
+		const right = layout.createDiv();
+		right.style.border = "1px solid var(--background-modifier-border)";
+		right.style.borderRadius = "8px";
+		right.style.overflow = "hidden";
+		right.style.display = "flex";
+		right.style.flexDirection = "column";
+
+		const rightHeader = right.createDiv();
+		rightHeader.style.padding = "8px 10px";
+		rightHeader.style.borderBottom = "1px solid var(--background-modifier-border)";
+		rightHeader.style.display = "flex";
+		rightHeader.style.justifyContent = "space-between";
+		rightHeader.style.alignItems = "center";
+
+		const rightTitle = rightHeader.createDiv({ text: "Diff" });
+		rightTitle.style.fontSize = "12px";
+		rightTitle.style.fontWeight = "600";
+		rightTitle.style.textTransform = "uppercase";
+		rightTitle.style.letterSpacing = "0.05em";
+		rightTitle.style.color = "var(--text-muted)";
+
+		const modeRow = rightHeader.createDiv();
+		modeRow.style.display = "flex";
+		modeRow.style.alignItems = "center";
+		modeRow.style.gap = "6px";
+
+		this.viewModeLabelEl = modeRow.createDiv({ text: "UNIFIED" });
+		this.viewModeLabelEl.style.fontSize = "10px";
+		this.viewModeLabelEl.style.letterSpacing = "0.05em";
+		this.viewModeLabelEl.style.color = "var(--text-muted)";
+
+		const modeBtn = modeRow.createEl("button", { text: "Split View" });
+		modeBtn.style.fontSize = "11px";
+		modeBtn.style.padding = "2px 8px";
+		modeBtn.style.border = "1px solid var(--background-modifier-border)";
+		modeBtn.style.borderRadius = "999px";
+		modeBtn.style.background = "var(--background-secondary)";
+		modeBtn.style.cursor = "pointer";
+		modeBtn.addEventListener("click", () => {
+			this.viewMode = this.viewMode === "unified" ? "split" : "unified";
+			this.viewModeLabelEl.setText(this.viewMode.toUpperCase());
+			modeBtn.setText(this.viewMode === "unified" ? "Split View" : "Unified View");
+			this.renderDiffText(this.currentDiffText || "No diff output for this file.");
+		});
+
+		this.diffEl = right.createDiv();
+		this.diffEl.style.margin = "0";
+		this.diffEl.style.padding = "10px";
+		this.diffEl.style.overflow = "auto";
+		this.diffEl.style.height = "100%";
+		this.diffEl.style.fontSize = "12px";
+		this.diffEl.style.lineHeight = "1.4";
+		this.diffEl.style.whiteSpace = "pre";
+		this.diffEl.style.fontFamily = "var(--font-monospace)";
+		this.renderDiffText("Loading changes...");
+
+		await this.loadChanges();
+	}
+
+	onClose() {
+		this.contentEl.empty();
+	}
+
+	private async loadChanges() {
+		try {
+			this.changes = await this.plugin.getChangedFilesWithKinds();
+			if (this.changes.length === 0) {
+				this.listEl.empty();
+				this.listEl.createEl("p", { text: "Working tree clean.", cls: "git-sidebar-empty" });
+				this.renderDiffText("No changes to show.");
+				return;
+			}
+
+			if (!this.selectedKey) {
+				this.selectedKey = `${this.changes[0].kind}:${this.changes[0].path}`;
+			}
+
+			this.renderFileList();
+			const selected = this.changes.find(
+				(c) => `${c.kind}:${c.path}` === this.selectedKey
+			) ?? this.changes[0];
+			await this.showDiffFor(selected);
+		} catch (e) {
+			this.listEl.empty();
+			this.renderDiffText("Failed to load git changes.");
+			const msg = e instanceof Error ? e.message : String(e);
+			new Notice(`Git diff popup failed: ${msg}`, 8000);
+		}
+	}
+
+	private renderFileList() {
+		this.listEl.empty();
+		for (const change of this.changes) {
+			const key = `${change.kind}:${change.path}`;
+			const row = this.listEl.createDiv();
+			row.style.padding = "6px 8px";
+			row.style.borderRadius = "6px";
+			row.style.cursor = "pointer";
+			row.style.marginBottom = "4px";
+			row.style.border = "1px solid var(--background-modifier-border)";
+			if (this.selectedKey === key) {
+				row.style.background = "var(--background-modifier-hover)";
+			}
+
+			const label = row.createDiv();
+			label.style.display = "flex";
+			label.style.justifyContent = "space-between";
+			label.style.alignItems = "center";
+			label.style.gap = "8px";
+
+			const pathEl = label.createEl("span", { text: change.path });
+			pathEl.style.fontSize = "12px";
+			pathEl.style.wordBreak = "break-all";
+
+			const kindEl = label.createEl("span", { text: change.kind });
+			kindEl.style.fontSize = "11px";
+			kindEl.style.color = "var(--text-muted)";
+			kindEl.style.textTransform = "uppercase";
+			kindEl.style.letterSpacing = "0.04em";
+
+			row.addEventListener("click", async () => {
+				this.selectedKey = key;
+				this.renderFileList();
+				await this.showDiffFor(change);
+			});
+		}
+	}
+
+	private async showDiffFor(change: GitChangeEntry) {
+		this.renderDiffText(`Loading diff for ${change.path}...`);
+		try {
+			const diff = await this.plugin.getDiffForChange(change);
+			this.currentDiffText = diff || "No diff output for this file.";
+			this.renderDiffText(this.currentDiffText);
+		} catch (e) {
+			const msg = e instanceof Error ? e.message : String(e);
+			this.renderDiffText(`Unable to load diff.\n${msg}`);
+		}
+	}
+
+	private renderDiffText(text: string) {
+		if (this.viewMode === "split") {
+			this.renderSplitDiff(text);
+			return;
+		}
+
+		this.diffEl.empty();
+		for (const line of text.split("\n")) {
+			const row = this.diffEl.createDiv({ text: line.length > 0 ? line : " " });
+			row.style.padding = "0 4px";
+			if (line.startsWith("+++ ") || line.startsWith("--- ")) {
+				row.style.color = "var(--text-accent)";
+				row.style.fontWeight = "600";
+			} else if (line.startsWith("@@")) {
+				row.style.color = "var(--color-cyan)";
+			} else if (line.startsWith("+") && !line.startsWith("+++")) {
+				row.style.color = "var(--color-green)";
+				row.style.background = "rgba(34, 197, 94, 0.12)";
+			} else if (line.startsWith("-") && !line.startsWith("---")) {
+				row.style.color = "var(--color-red)";
+				row.style.background = "rgba(239, 68, 68, 0.12)";
+			} else if (line.startsWith("diff --git") || line.startsWith("index ")) {
+				row.style.color = "var(--text-faint)";
+			}
+		}
+	}
+
+	private renderSplitDiff(text: string) {
+		this.diffEl.empty();
+
+		const grid = this.diffEl.createDiv();
+		grid.style.display = "grid";
+		grid.style.gridTemplateColumns = "1fr 1fr";
+		grid.style.gap = "0";
+
+		const leftHeader = grid.createDiv({ text: "Original" });
+		leftHeader.style.padding = "4px 8px";
+		leftHeader.style.fontSize = "11px";
+		leftHeader.style.color = "var(--text-muted)";
+		leftHeader.style.borderBottom = "1px solid var(--background-modifier-border)";
+		leftHeader.style.borderRight = "1px solid var(--background-modifier-border)";
+
+		const rightHeader = grid.createDiv({ text: "Changed" });
+		rightHeader.style.padding = "4px 8px";
+		rightHeader.style.fontSize = "11px";
+		rightHeader.style.color = "var(--text-muted)";
+		rightHeader.style.borderBottom = "1px solid var(--background-modifier-border)";
+
+		const lines = text.split("\n");
+		for (let i = 0; i < lines.length; i++) {
+			const line = lines[i];
+			const next = i + 1 < lines.length ? lines[i + 1] : "";
+
+			if (line.startsWith("@@")) {
+				const metaLeft = grid.createDiv({ text: line });
+				metaLeft.style.gridColumn = "1 / span 2";
+				metaLeft.style.padding = "2px 8px";
+				metaLeft.style.color = "var(--color-cyan)";
+				metaLeft.style.background = "var(--background-secondary)";
+				continue;
+			}
+
+			if (line.startsWith("diff --git") || line.startsWith("index ") || line.startsWith("--- ") || line.startsWith("+++ ")) {
+				const meta = grid.createDiv({ text: line });
+				meta.style.gridColumn = "1 / span 2";
+				meta.style.padding = "2px 8px";
+				meta.style.color = "var(--text-faint)";
+				continue;
+			}
+
+			if (line.startsWith("-") && !line.startsWith("---") && next.startsWith("+") && !next.startsWith("+++")) {
+				this.addSplitRow(grid, line.slice(1), next.slice(1), "removed", "added");
+				i++;
+				continue;
+			}
+
+			if (line.startsWith("-") && !line.startsWith("---")) {
+				this.addSplitRow(grid, line.slice(1), "", "removed", "normal");
+				continue;
+			}
+
+			if (line.startsWith("+") && !line.startsWith("+++")) {
+				this.addSplitRow(grid, "", line.slice(1), "normal", "added");
+				continue;
+			}
+
+			if (line.startsWith(" ")) {
+				this.addSplitRow(grid, line.slice(1), line.slice(1), "normal", "normal");
+				continue;
+			}
+
+			if (line.trim().length > 0) {
+				this.addSplitRow(grid, line, line, "meta", "meta");
+			}
+		}
+	}
+
+	private addSplitRow(
+		grid: HTMLElement,
+		leftText: string,
+		rightText: string,
+		leftKind: "normal" | "removed" | "meta",
+		rightKind: "normal" | "added" | "meta"
+	) {
+		const left = grid.createDiv({ text: leftText.length > 0 ? leftText : " " });
+		left.style.padding = "0 8px";
+		left.style.borderRight = "1px solid var(--background-modifier-border)";
+		left.style.whiteSpace = "pre";
+
+		const right = grid.createDiv({ text: rightText.length > 0 ? rightText : " " });
+		right.style.padding = "0 8px";
+		right.style.whiteSpace = "pre";
+
+		if (leftKind === "removed") {
+			left.style.color = "var(--color-red)";
+			left.style.background = "rgba(239, 68, 68, 0.12)";
+		} else if (leftKind === "meta") {
+			left.style.color = "var(--text-faint)";
+		}
+
+		if (rightKind === "added") {
+			right.style.color = "var(--color-green)";
+			right.style.background = "rgba(34, 197, 94, 0.12)";
+		} else if (rightKind === "meta") {
+			right.style.color = "var(--text-faint)";
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Settings Tab
 // ---------------------------------------------------------------------------
 
@@ -608,6 +946,14 @@ export default class GitIntegrationPlugin extends Plugin {
 				} catch (e) {
 					this.handleError("get status", e);
 				}
+			},
+		});
+
+		this.addCommand({
+			id: "git-review-diff",
+			name: "Review changes and diff",
+			callback: () => {
+				this.gitShowChangesDiffPopup();
 			},
 		});
 
@@ -863,6 +1209,10 @@ export default class GitIntegrationPlugin extends Plugin {
 		}
 	}
 
+	gitShowChangesDiffPopup(): void {
+		new GitChangesDiffModal(this.app, this).open();
+	}
+
 	async gitCommitWithPrompt(): Promise<void> {
 		const defaultMsg = this.buildCommitMessage();
 		return new Promise((resolve) => {
@@ -922,6 +1272,43 @@ export default class GitIntegrationPlugin extends Plugin {
 		} catch (e) {
 			this.handleError("pull", e);
 		}
+	}
+
+	async getChangedFilesWithKinds(): Promise<GitChangeEntry[]> {
+		const status = await this.git.status();
+		const entries: GitChangeEntry[] = [];
+		const seen = new Set<string>();
+
+		const addEntries = (files: string[], kind: GitChangeKind) => {
+			for (const file of files) {
+				const key = `${kind}:${file}`;
+				if (seen.has(key)) continue;
+				entries.push({ path: file, kind });
+				seen.add(key);
+			}
+		};
+
+		addEntries(status.staged, "staged");
+		addEntries(status.modified, "modified");
+		addEntries(status.not_added, "untracked");
+		addEntries(status.deleted, "deleted");
+		addEntries(status.conflicted, "conflicted");
+
+		return entries;
+	}
+
+	async getDiffForChange(change: GitChangeEntry): Promise<string> {
+		if (change.kind === "untracked") {
+			return `File: ${change.path}\n\nThis file is untracked. Stage it to view a standard git diff.`;
+		}
+
+		if (change.kind === "staged") {
+			const cachedDiff = await this.git.diff(["--cached", "--", change.path]);
+			return cachedDiff || `No staged diff output for ${change.path}.`;
+		}
+
+		const diff = await this.git.diff(["--", change.path]);
+		return diff || `No unstaged diff output for ${change.path}.`;
 	}
 
 	// -------------------------------------------------------------------------
