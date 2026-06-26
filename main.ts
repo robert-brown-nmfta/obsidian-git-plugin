@@ -478,7 +478,7 @@ class GitChangesDiffModal extends Modal {
 		contentEl.style.height = "100%";
 		contentEl.style.display = "flex";
 		contentEl.style.flexDirection = "column";
-		contentEl.createEl("h2", { text: "Changes and Diff" });
+		contentEl.createEl("h2", { text: "Review Changes" });
 
 		const layout = contentEl.createDiv();
 		layout.style.display = "grid";
@@ -551,6 +551,21 @@ class GitChangesDiffModal extends Modal {
 			this.viewModeLabelEl.setText(this.viewMode.toUpperCase());
 			modeBtn.setText(this.viewMode === "unified" ? "Split View" : "Unified View");
 			this.renderDiffText(this.currentDiffText || "No diff output for this file.");
+		});
+
+		const revertBtn = modeRow.createEl("button", { text: "Revert Unstaged" });
+		revertBtn.style.fontSize = "11px";
+		revertBtn.style.padding = "2px 8px";
+		revertBtn.style.border = "1px solid var(--background-modifier-border)";
+		revertBtn.style.borderRadius = "999px";
+		revertBtn.style.background = "var(--background-secondary)";
+		revertBtn.style.cursor = "pointer";
+		revertBtn.addEventListener("click", async () => {
+			if (!this.selectedKey) return;
+			const selected = this.changes.find((c) => `${c.kind}:${c.path}` === this.selectedKey);
+			if (!selected) return;
+			await this.plugin.revertUnstagedChanges(selected.path);
+			await this.loadChanges();
 		});
 
 		this.diffEl = right.createDiv();
@@ -1318,6 +1333,17 @@ export default class GitIntegrationPlugin extends Plugin {
 			this.updateStatusBar();
 		} catch (e) {
 			this.handleError("pull", e);
+		}
+	}
+
+	async revertUnstagedChanges(filePath: string): Promise<void> {
+		try {
+			new Notice(`Reverting unstaged changes in ${filePath}...`);
+			await this.git.checkout([filePath]);
+			new Notice(`Reverted unstaged changes: ${filePath}`);
+			this.updateStatusBar();
+		} catch (e) {
+			this.handleError(`revert unstaged changes in ${filePath}`, e);
 		}
 	}
 
