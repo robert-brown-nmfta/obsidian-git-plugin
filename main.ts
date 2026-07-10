@@ -71,13 +71,18 @@ export class GitSidebarView extends ItemView {
 		// ---- Load status + log ----
 		let status: StatusResult | null = null;
 		let log: LogResult | null = null;
+		let remoteNames: string[] = [];
 		let repoError = false;
 
 		try {
-			[status, log] = await Promise.all([
+			const [s, l, remotes] = await Promise.all([
 				this.plugin.git.status(),
 				this.plugin.git.log({ maxCount: 10 }),
+				this.plugin.git.getRemotes(false),
 			]);
+			status = s;
+			log = l;
+			remoteNames = remotes.map((r) => r.name);
 		} catch {
 			repoError = true;
 		}
@@ -97,6 +102,24 @@ export class GitSidebarView extends ItemView {
 		branchRow.createEl("span", { text: status.current ?? "unknown", cls: "git-sidebar-branch-name" });
 		if (status.tracking) {
 			branchRow.createEl("span", { text: `→ ${status.tracking}`, cls: "git-sidebar-tracking" });
+		}
+		if (remoteNames.length > 1) {
+			const pushRemoteLabel = branchRow.createEl("span", {
+				text: `push: ${this.plugin.settings.preferredRemote || "?"}`,
+				cls: "git-sidebar-tracking",
+			});
+			const changeRemoteBtn = branchRow.createEl("button", {
+				cls: "git-sidebar-icon-btn",
+				attr: { "aria-label": "Change push remote" },
+			});
+			changeRemoteBtn.innerHTML = `<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/><path d="M4.93 4.93a10 10 0 0 0 0 14.14"/></svg>`;
+			changeRemoteBtn.addEventListener("click", () => {
+				new RemoteSelectModal(this.plugin.app, remoteNames, async (selected) => {
+					this.plugin.settings.preferredRemote = selected;
+					await this.plugin.saveSettings();
+					pushRemoteLabel.setText(`push: ${selected}`);
+				}).open();
+			});
 		}
 
 		// ahead / behind pills
@@ -250,6 +273,7 @@ interface GitIntegrationSettings {
 	defaultCommitMessage: string;
 	showStatusBar: boolean;
 	dateFormat: string;
+	preferredRemote: string;
 }
 
 type GitChangeKind = "staged" | "modified" | "untracked" | "deleted" | "conflicted";
@@ -266,6 +290,7 @@ const DEFAULT_SETTINGS: GitIntegrationSettings = {
 	defaultCommitMessage: "vault backup: {{date}}",
 	showStatusBar: true,
 	dateFormat: "YYYY-MM-DD HH:mm:ss",
+	preferredRemote: "",
 };
 
 // ---------------------------------------------------------------------------
@@ -442,6 +467,46 @@ class GitStatusModal extends Modal {
 		if (!hasContent) {
 			contentEl.createEl("p", { text: "Working tree clean. Nothing to commit." });
 		}
+	}
+
+	onClose() {
+		this.contentEl.empty();
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Remote Select Modal
+// ---------------------------------------------------------------------------
+
+class RemoteSelectModal extends Modal {
+	private remotes: string[];
+	private onSelect: (remote: string) => void;
+
+	constructor(app: App, remotes: string[], onSelect: (remote: string) => void) {
+		super(app);
+		this.remotes = remotes;
+		this.onSelect = onSelect;
+	}
+
+	onOpen() {
+		const { contentEl } = this;
+		contentEl.createEl("h2", { text: "Select remote to push to" });
+
+		for (const remote of this.remotes) {
+			const btn = contentEl.createEl("button", { text: remote, cls: "mod-cta" });
+			btn.style.display = "block";
+			btn.style.width = "100%";
+			btn.style.marginBottom = "8px";
+			btn.addEventListener("click", () => {
+				this.close();
+				this.onSelect(remote);
+			});
+		}
+
+		const cancelBtn = contentEl.createEl("button", { text: "Cancel" });
+		cancelBtn.style.display = "block";
+		cancelBtn.style.width = "100%";
+		cancelBtn.addEventListener("click", () => this.close());
 	}
 
 	onClose() {
@@ -921,6 +986,47 @@ class GitIntegrationSettingTab extends PluginSettingTab {
 						await this.plugin.saveSettings();
 					})
 			);
+
+		// --- Remote ---
+		containerEl.createEl("h3", { text: "Remote" });
+
+		const remoteSetting = new Setting(containerEl)
+			.setName("Preferred push remote")
+			.setDesc(
+				this.plugin.settings.preferredRemote
+					? `Currently: ${this.plugin.settings.preferredRemote}`
+					: "Not set — will prompt on first push when multiple remotes exist."
+			);
+
+		remoteSetting.addButton((btn) =>
+			btn.setButtonText("Change").onClick(async () => {
+				try {
+					const remotes = await this.plugin.git.getRemotes(false);
+					const remoteNames = remotes.map((r) => r.name);
+					if (remoteNames.length === 0) {
+						new Notice("No remotes configured.");
+						return;
+					}
+					new RemoteSelectModal(this.plugin.app, remoteNames, async (selected) => {
+						this.plugin.settings.preferredRemote = selected;
+						await this.plugin.saveSettings();
+						this.display();
+					}).open();
+				} catch (e) {
+					new Notice("Failed to fetch remotes.");
+				}
+			})
+		);
+
+		if (this.plugin.settings.preferredRemote) {
+			remoteSetting.addButton((btn) =>
+				btn.setButtonText("Clear").onClick(async () => {
+					this.plugin.settings.preferredRemote = "";
+					await this.plugin.saveSettings();
+					this.display();
+				})
+			);
+		}
 	}
 }
 
@@ -1280,8 +1386,42 @@ export default class GitIntegrationPlugin extends Plugin {
 
 	async gitPush(silent = false): Promise<void> {
 		try {
-			if (!silent) new Notice("Pushing…");
-			await this.git.push();
+			const remotes = await this.git.getRemotes(false);
+			if (remotes.length === 0) {
+				new Notice("No remotes configured.");
+				return;
+			}
+
+			const remoteNames = remotes.map((r) => r.name);
+
+			if (remotes.length === 1) {
+				// Single remote — use it directly
+				await this.doPush(remoteNames[0], silent);
+				return;
+			}
+
+			// Multiple remotes — use saved preference if valid
+			const saved = this.settings.preferredRemote;
+			if (saved && remoteNames.includes(saved)) {
+				await this.doPush(saved, silent);
+				return;
+			}
+
+			// No valid preference saved — ask once and remember
+			new RemoteSelectModal(this.app, remoteNames, async (selectedRemote) => {
+				this.settings.preferredRemote = selectedRemote;
+				await this.saveSettings();
+				await this.doPush(selectedRemote, silent);
+			}).open();
+		} catch (e) {
+			this.handleError("push", e);
+		}
+	}
+
+	private async doPush(remote: string, silent: boolean): Promise<void> {
+		try {
+			if (!silent) new Notice(`Pushing to ${remote}…`);
+			await this.git.push(remote);
 			new Notice("Push complete.");
 			this.updateStatusBar();
 		} catch (e) {
