@@ -155,6 +155,9 @@ export class GitSidebarView extends ItemView {
 		makeBtn("Review Diffs", `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1.5 12.5a2 2 0 0 1-2 1.5h-7a2 2 0 0 1-2-1.5L5 6"/><path d="M10 11h4"/></svg>`, () => {
 			this.plugin.gitShowChangesDiffPopup();
 		});
+		makeBtn("Yesterday", `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 14"/></svg>`, () => {
+			this.plugin.gitShowYesterdayDeltas();
+		});
 		if (status.staged.length > 0) {
 			makeBtn("Unstage All", `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/><line x1="2" y1="2" x2="22" y2="22"/></svg>`, () => {
 				this.plugin.gitUnstageAll().then(() => this.render());
@@ -306,6 +309,24 @@ function formatDate(format: string): string {
 		.replace("HH", String(now.getHours()).padStart(2, "0"))
 		.replace("mm", String(now.getMinutes()).padStart(2, "0"))
 		.replace("ss", String(now.getSeconds()).padStart(2, "0"));
+}
+
+/** Formats a Date as a local `YYYY-MM-DD HH:mm:ss` string that git parses in local time. */
+function formatGitDate(date: Date): string {
+	const pad = (n: number) => String(n).padStart(2, "0");
+	return (
+		`${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ` +
+		`${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+	);
+}
+
+/** Returns the local [start, end) range covering all of yesterday. */
+function getYesterdayRange(): { since: Date; until: Date } {
+	const now = new Date();
+	const startToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+	const startYesterday = new Date(startToday);
+	startYesterday.setDate(startYesterday.getDate() - 1);
+	return { since: startYesterday, until: startToday };
 }
 
 // ---------------------------------------------------------------------------
@@ -885,6 +906,213 @@ class GitChangesDiffModal extends Modal {
 }
 
 // ---------------------------------------------------------------------------
+// Yesterday's Deltas Modal
+// ---------------------------------------------------------------------------
+
+class YesterdayDeltaModal extends Modal {
+	private plugin: GitIntegrationPlugin;
+	private commits: LogResult["all"][number][] = [];
+	private selectedHash: string | null = null;
+	private listEl: HTMLElement;
+	private diffEl: HTMLElement;
+
+	constructor(app: App, plugin: GitIntegrationPlugin) {
+		super(app);
+		this.plugin = plugin;
+	}
+
+	async onOpen() {
+		const { contentEl } = this;
+		this.modalEl.style.width = "88vw";
+		this.modalEl.style.maxWidth = "1500px";
+		this.modalEl.style.height = "82vh";
+		this.modalEl.style.maxHeight = "90vh";
+		contentEl.empty();
+		contentEl.style.height = "100%";
+		contentEl.style.display = "flex";
+		contentEl.style.flexDirection = "column";
+
+		const { since, until } = getYesterdayRange();
+		const dateLabel = formatGitDate(since).substring(0, 10);
+		contentEl.createEl("h2", { text: `Yesterday's Work — ${dateLabel}` });
+
+		const layout = contentEl.createDiv();
+		layout.style.display = "grid";
+		layout.style.gridTemplateColumns = "minmax(280px, 32%) 1fr";
+		layout.style.gap = "12px";
+		layout.style.height = "100%";
+		layout.style.minHeight = "420px";
+
+		const left = layout.createDiv();
+		left.style.border = "1px solid var(--background-modifier-border)";
+		left.style.borderRadius = "8px";
+		left.style.overflow = "hidden";
+		left.style.display = "flex";
+		left.style.flexDirection = "column";
+
+		const leftHeader = left.createDiv();
+		leftHeader.style.padding = "8px 10px";
+		leftHeader.style.borderBottom = "1px solid var(--background-modifier-border)";
+		leftHeader.style.fontSize = "12px";
+		leftHeader.style.fontWeight = "600";
+		leftHeader.style.textTransform = "uppercase";
+		leftHeader.style.letterSpacing = "0.05em";
+		leftHeader.style.color = "var(--text-muted)";
+		leftHeader.setText("Commits");
+
+		this.listEl = left.createDiv();
+		this.listEl.style.overflowY = "auto";
+		this.listEl.style.padding = "6px";
+
+		const right = layout.createDiv();
+		right.style.border = "1px solid var(--background-modifier-border)";
+		right.style.borderRadius = "8px";
+		right.style.overflow = "hidden";
+		right.style.display = "flex";
+		right.style.flexDirection = "column";
+
+		const rightHeader = right.createDiv();
+		rightHeader.style.padding = "8px 10px";
+		rightHeader.style.borderBottom = "1px solid var(--background-modifier-border)";
+		rightHeader.style.fontSize = "12px";
+		rightHeader.style.fontWeight = "600";
+		rightHeader.style.textTransform = "uppercase";
+		rightHeader.style.letterSpacing = "0.05em";
+		rightHeader.style.color = "var(--text-muted)";
+		rightHeader.setText("Diff");
+
+		this.diffEl = right.createDiv();
+		this.diffEl.style.margin = "0";
+		this.diffEl.style.padding = "10px";
+		this.diffEl.style.overflow = "auto";
+		this.diffEl.style.height = "100%";
+		this.diffEl.style.fontSize = "12px";
+		this.diffEl.style.lineHeight = "1.4";
+		this.diffEl.style.whiteSpace = "pre";
+		this.diffEl.style.fontFamily = "var(--font-monospace)";
+		this.renderDiffText("Loading yesterday's commits...");
+
+		await this.loadCommits(since, until);
+	}
+
+	onClose() {
+		this.contentEl.empty();
+	}
+
+	private async loadCommits(since: Date, until: Date) {
+		try {
+			this.commits = await this.plugin.getCommitsInRange(since, until);
+			if (this.commits.length === 0) {
+				this.listEl.empty();
+				this.listEl.createEl("p", {
+					text: "No commits made yesterday.",
+					cls: "git-sidebar-empty",
+				});
+				this.renderDiffText("Nothing was committed yesterday.");
+				return;
+			}
+
+			if (!this.selectedHash) {
+				this.selectedHash = this.commits[0].hash;
+			}
+
+			this.renderCommitList();
+			const selected =
+				this.commits.find((c) => c.hash === this.selectedHash) ?? this.commits[0];
+			await this.showDiffFor(selected.hash);
+		} catch (e) {
+			this.listEl.empty();
+			this.renderDiffText("Failed to load yesterday's commits.");
+			const msg = e instanceof Error ? e.message : String(e);
+			new Notice(`Yesterday's deltas failed: ${msg}`, 8000);
+		}
+	}
+
+	private renderCommitList() {
+		this.listEl.empty();
+		for (const commit of this.commits) {
+			const row = this.listEl.createDiv();
+			row.style.padding = "6px 8px";
+			row.style.borderRadius = "6px";
+			row.style.cursor = "pointer";
+			row.style.marginBottom = "4px";
+			row.style.border = "1px solid var(--background-modifier-border)";
+			if (this.selectedHash === commit.hash) {
+				row.style.background = "var(--background-modifier-hover)";
+			}
+
+			const topRow = row.createDiv();
+			topRow.style.display = "flex";
+			topRow.style.alignItems = "center";
+			topRow.style.gap = "6px";
+
+			const hashEl = topRow.createEl("code", { text: commit.hash.substring(0, 7) });
+			hashEl.style.fontSize = "11px";
+			hashEl.style.padding = "1px 5px";
+			hashEl.style.background = "var(--background-secondary)";
+			hashEl.style.borderRadius = "3px";
+			hashEl.style.color = "var(--text-muted)";
+
+			const timeEl = topRow.createEl("span", {
+				text: commit.date.substring(11, 16),
+			});
+			timeEl.style.fontSize = "11px";
+			timeEl.style.color = "var(--text-muted)";
+
+			const msgEl = row.createDiv({ text: commit.message });
+			msgEl.style.fontSize = "12px";
+			msgEl.style.marginTop = "3px";
+			msgEl.style.wordBreak = "break-word";
+
+			row.addEventListener("click", async () => {
+				this.selectedHash = commit.hash;
+				this.renderCommitList();
+				await this.showDiffFor(commit.hash);
+			});
+		}
+	}
+
+	private async showDiffFor(hash: string) {
+		this.renderDiffText(`Loading diff for ${hash.substring(0, 7)}...`);
+		try {
+			const diff = await this.plugin.getCommitDiff(hash);
+			this.renderDiffText(diff || "No diff output for this commit.");
+		} catch (e) {
+			const msg = e instanceof Error ? e.message : String(e);
+			this.renderDiffText(`Unable to load diff.\n${msg}`);
+		}
+	}
+
+	private renderDiffText(text: string) {
+		this.diffEl.empty();
+		for (const line of text.split("\n")) {
+			const row = this.diffEl.createDiv({ text: line.length > 0 ? line : " " });
+			row.style.padding = "0 4px";
+			if (line.startsWith("+++ ") || line.startsWith("--- ")) {
+				row.style.color = "var(--text-accent)";
+				row.style.fontWeight = "600";
+			} else if (line.startsWith("@@")) {
+				row.style.color = "var(--color-cyan)";
+			} else if (line.startsWith("+") && !line.startsWith("+++")) {
+				row.style.color = "var(--color-green)";
+				row.style.background = "rgba(34, 197, 94, 0.12)";
+			} else if (line.startsWith("-") && !line.startsWith("---")) {
+				row.style.color = "var(--color-red)";
+				row.style.background = "rgba(239, 68, 68, 0.12)";
+			} else if (
+				line.startsWith("commit ") ||
+				line.startsWith("Author:") ||
+				line.startsWith("Date:")
+			) {
+				row.style.color = "var(--text-muted)";
+			} else if (line.startsWith("diff --git") || line.startsWith("index ")) {
+				row.style.color = "var(--text-faint)";
+			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Settings Tab
 // ---------------------------------------------------------------------------
 
@@ -1102,6 +1330,14 @@ export default class GitIntegrationPlugin extends Plugin {
 			name: "Review changes and diff",
 			callback: () => {
 				this.gitShowChangesDiffPopup();
+			},
+		});
+
+		this.addCommand({
+			id: "git-yesterday-deltas",
+			name: "Show yesterday's changes",
+			callback: () => {
+				this.gitShowYesterdayDeltas();
 			},
 		});
 
@@ -1522,6 +1758,29 @@ export default class GitIntegrationPlugin extends Plugin {
 
 		const diff = await this.git.diff(["--", change.path]);
 		return diff || `No unstaged diff output for ${change.path}.`;
+	}
+
+	/**
+	 * Returns commits authored within a given local date range (inclusive of
+	 * `since`, exclusive of `until`).
+	 */
+	async getCommitsInRange(since: Date, until: Date): Promise<LogResult["all"][number][]> {
+		const log = await this.git.log({
+			"--since": formatGitDate(since),
+			"--until": formatGitDate(until),
+		});
+		return [...log.all];
+	}
+
+	/** Returns the full commit diff (metadata + patch) for a single commit. */
+	async getCommitDiff(hash: string): Promise<string> {
+		const output = await this.git.show([hash]);
+		return output || `No diff output for ${hash}.`;
+	}
+
+	/** Opens the modal showing everything committed yesterday. */
+	gitShowYesterdayDeltas(): void {
+		new YesterdayDeltaModal(this.app, this).open();
 	}
 
 	// -------------------------------------------------------------------------
